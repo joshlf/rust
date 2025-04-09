@@ -208,13 +208,132 @@ mod alt {
         let y = Tree::Seq(vec![Tree::bool(), Tree::from_bits(1)]);
         let layout = Tree::Alt(vec![x, y]);
 
-        let answer = crate::maybe_transmutable::MaybeTransmutableQuery::new(
-            layout.clone(),
-            layout.clone(),
-            crate::Assume::default(),
-            UltraMinimal,
-        )
-        .answer();
-        assert_eq!(answer, Answer::Yes, "layout:{:#?}", layout);
+        for v in [false, true] {
+            let answer =
+                is_transmutable(&layout, &layout, Assume { validity: v, ..Assume::default() });
+            assert_eq!(answer, Answer::Yes, "assume validity:{v}");
+        }
+    }
+}
+
+mod char {
+    use super::*;
+    use crate::{Answer, Reason, layout::tree::Endian};
+
+    #[test]
+    fn should_permit_identity_transmutation() {
+        for order in [Endian::Little, Endian::Big] {
+            let char = layout::Tree::<Def, !>::char(order);
+            for v in [false, true] {
+                let answer =
+                    is_transmutable(&char, &char, Assume { validity: v, ..Assume::default() });
+                assert_eq!(answer, Answer::Yes, "endian:{order:?}, assume validity:{v}");
+            }
+        }
+    }
+
+    #[test]
+    fn should_permit_valid_transmutation() {
+        for order in [Endian::Little] {
+            use Answer::*;
+            let char_layout = layout::Tree::<Def, !>::char(order);
+            let char_layout = char_layout.prune(&|_def| false);
+            let char_layout = layout::Nfa::from_tree(char_layout).unwrap();
+            let char_layout = layout::Dfa::from_nfa(char_layout);
+
+            // `char`s can be in the following ranges:
+            // - [0, 0xD7FF]
+            // - [0xE000, 10FFFF]
+            //
+            // This loop synthesizes a singleton-validity type for the extremes
+            // of each range, and for one past the end of the extremes of each
+            // range.
+            let no = No(Reason::DstIsBitIncompatible);
+            for (src, answer) in [
+                (0u32, Yes),
+                (0xD7FF, Yes),
+                (0xD800, no.clone()),
+                (0xDFFF, no.clone()),
+                (0xE000, Yes),
+                (0x10FFFF, Yes),
+                (0x110000, no.clone()),
+                (0xFFFF0000, no.clone()),
+                (0xFFFFFFFF, no),
+            ] {
+                let src = layout::tree::Tree::<Def, !>::from_big_endian(
+                    order,
+                    src.to_be_bytes().map(|b| b..=b),
+                );
+                let src = src.prune(&|_def| false);
+                let src = layout::Nfa::from_tree(src).unwrap();
+                let src = layout::Dfa::from_nfa(src);
+                let a = crate::maybe_transmutable::MaybeTransmutableQuery::new(
+                    src.clone(),
+                    char_layout.clone(),
+                    crate::Assume::default(),
+                    UltraMinimal,
+                )
+                .answer();
+                assert_eq!(
+                    a,
+                    answer,
+                    "endian:{order:?},\nsrc:{src:#?},\ndst:{:#?}",
+                    char_layout.clone()
+                );
+            }
+        }
+    }
+}
+
+mod nonzero {
+    use std::num::NonZeroUsize;
+
+    use super::*;
+    use crate::{Answer, Reason};
+
+    const NONZERO_BYTE_WIDTHS: [NonZeroUsize; 5] = [
+        NonZeroUsize::new(1).unwrap(),
+        NonZeroUsize::new(2).unwrap(),
+        NonZeroUsize::new(4).unwrap(),
+        NonZeroUsize::new(8).unwrap(),
+        NonZeroUsize::new(16).unwrap(),
+    ];
+
+    #[test]
+    fn should_permit_identity_transmutation() {
+        for width in NONZERO_BYTE_WIDTHS {
+            let layout = layout::Tree::<Def, !>::nonzero(width);
+            let answer = crate::maybe_transmutable::MaybeTransmutableQuery::new(
+                layout.clone(),
+                layout,
+                crate::Assume::default(),
+                UltraMinimal,
+            )
+            .answer();
+            assert_eq!(answer, Answer::Yes);
+        }
+    }
+
+    #[test]
+    fn should_permit_valid_transmutation() {
+        for width in NONZERO_BYTE_WIDTHS {
+            use Answer::*;
+
+            let num = layout::Tree::<Def, !>::number(width);
+            let nz = layout::Tree::<Def, !>::nonzero(width);
+
+            for (src, dst, answer) in
+                [(num.clone(), nz.clone(), No(Reason::DstIsBitIncompatible)), (nz, num, Yes)]
+            {
+                let a = crate::maybe_transmutable::MaybeTransmutableQuery::new(
+                    src.clone(),
+                    dst.clone(),
+                    crate::Assume::default(),
+                    UltraMinimal,
+                )
+                .answer();
+                assert_eq!(a, answer, "width:{width},\nsrc:{src:?},\ndst:{dst:?}");
+            }
+        }
     }
 }

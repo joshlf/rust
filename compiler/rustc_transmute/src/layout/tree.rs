@@ -1,4 +1,7 @@
-use std::ops::ControlFlow;
+use std::{
+    num::NonZeroUsize,
+    ops::{ControlFlow, RangeInclusive},
+};
 
 use super::{Byte, Def, Ref};
 
@@ -32,6 +35,22 @@ where
     Byte(Byte),
 }
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub(crate) enum Endian {
+    Little,
+    Big,
+}
+
+#[cfg(feature = "rustc")]
+impl From<rustc_abi::Endian> for Endian {
+    fn from(order: rustc_abi::Endian) -> Endian {
+        match order {
+            rustc_abi::Endian::Little => Endian::Little,
+            rustc_abi::Endian::Big => Endian::Big,
+        }
+    }
+}
+
 impl<D, R> Tree<D, R>
 where
     D: Def,
@@ -59,12 +78,54 @@ where
 
     /// A `Tree` representing the layout of `bool`.
     pub(crate) fn bool() -> Self {
-        Self::Byte(Byte::from_iters([0x00..=0x01]))
+        Self::from_iters([0x00..=0x01])
     }
 
     /// A `Tree` whose layout matches that of a `u8`.
     pub(crate) fn u8() -> Self {
-        Self::Byte(Byte::from_iters([0x00..=0xFF]))
+        Self::from_iters([0x00..=0xFF])
+    }
+
+    /// A `Tree` whose layout matches that of a `char`.
+    pub(crate) fn char(order: Endian) -> Self {
+        // `char`s can be in the following ranges:
+        // - [0, 0xD7FF]
+        // - [0xE000, 10FFFF]
+        //
+        // All other `char` values are illegal. We can thus represent a `char`
+        // as a union of three possible layouts:
+        // - 00 00 [00, D7] XX
+        // - 00 00 [E0, FF] XX
+        // - 00 [01, 10] XX XX
+
+        const _0: RangeInclusive<u8> = 0..=0;
+        const BYTE: RangeInclusive<u8> = 0x00..=0xFF;
+        // OverB(B) = 0xD800,
+        // UnderC(C) = 0xDFFF,
+        let x = Self::from_big_endian(order, [_0, _0, 0x00..=0xD7, BYTE]);
+        let y = Self::from_big_endian(order, [_0, _0, 0xE0..=0xFF, BYTE]);
+        let z = Self::from_big_endian(order, [_0, 0x01..=0x10, BYTE, BYTE]);
+        Self::alt([x, y, z])
+    }
+
+    /// A `Tree` whose layout matches `std::num::NonZeroXxx`.
+    #[allow(dead_code)]
+    pub(crate) fn nonzero(width_in_bytes: NonZeroUsize) -> Self {
+        const BYTE: RangeInclusive<u8> = 0x00..=0xFF;
+        const NONZERO: RangeInclusive<u8> = 0x01..=0xFF;
+
+        let width = width_in_bytes.get();
+        (0..width)
+            .map(|nz_idx| {
+                (0..width)
+                    .map(|pos| Self::from_iters([if pos == nz_idx { NONZERO } else { BYTE }]))
+                    .fold(Self::unit(), Self::then)
+            })
+            .fold(Self::uninhabited(), Self::or)
+    }
+
+    pub(crate) fn from_iters<const N: usize, I: Iterator<Item = u8>>(iters: [I; N]) -> Self {
+        Self::Byte(Byte::from_iters(iters))
     }
 
     /// A `Tree` whose layout accepts exactly the given bit pattern.
@@ -73,8 +134,8 @@ where
     }
 
     /// A `Tree` whose layout is a number of the given width.
-    pub(crate) fn number(width_in_bytes: usize) -> Self {
-        Self::Seq(vec![Self::u8(); width_in_bytes])
+    pub(crate) fn number(width_in_bytes: NonZeroUsize) -> Self {
+        Self::Seq(vec![Self::u8(); width_in_bytes.get()])
     }
 
     /// A `Tree` whose layout is entirely padding of the given width.
@@ -125,13 +186,35 @@ where
             Self::Byte(..) | Self::Ref(..) | Self::Def(..) => true,
         }
     }
-}
 
-impl<D, R> Tree<D, R>
-where
-    D: Def,
-    R: Ref,
-{
+    /// Produces a `Tree` which represents a sequence of bytes stored in
+    /// `order`.
+    ///
+    /// `bytes` is taken to be in big-endian byte order, and its order will be
+    /// swapped if `order == Endian::Little`.
+    pub(crate) fn from_big_endian<const N: usize, I: Iterator<Item = u8>>(
+        order: Endian,
+        mut bytes: [I; N],
+    ) -> Self {
+        if order == Endian::Little {
+            (&mut bytes[..]).reverse();
+        }
+
+        Self::seq(bytes.map(|iter| Self::from_iters([iter])))
+    }
+
+    /// Produces a `Tree` where each of the trees in `trees` are sequenced one
+    /// after another.
+    pub(crate) fn seq<const N: usize>(trees: [Tree<D, R>; N]) -> Self {
+        trees.into_iter().fold(Tree::unit(), Self::then)
+    }
+
+    /// Produces a `Tree` where each of the trees in `trees` are accepted as
+    /// alternative layouts.
+    pub(crate) fn alt<const N: usize>(trees: [Tree<D, R>; N]) -> Self {
+        trees.into_iter().fold(Tree::uninhabited(), Self::or)
+    }
+
     /// Produces a new `Tree` where `other` is sequenced after `self`.
     pub(crate) fn then(self, other: Self) -> Self {
         match (self, other) {
@@ -267,6 +350,8 @@ pub(crate) mod rustc {
                         size,
                     }))
                 }
+
+                ty::Char => Ok(Self::char(cx.tcx().data_layout.endian.into())),
 
                 _ => Err(Err::NotYetSupported),
             }

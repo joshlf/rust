@@ -1,7 +1,6 @@
 use std::fmt;
-use std::sync::atomic::{AtomicU32, Ordering};
 
-use super::{Byte, Ref, Tree, Uninhabited};
+use super::{Byte, GlobalCounter, Ref, Tree, Uninhabited};
 use crate::{Map, Set};
 
 /// A non-deterministic finite automaton (NFA) that represents the layout of a type.
@@ -18,7 +17,7 @@ where
 
 /// The states in a `Nfa` represent byte offsets.
 #[derive(Hash, Eq, PartialEq, PartialOrd, Ord, Copy, Clone)]
-pub(crate) struct State(u32);
+pub(crate) struct State(pub(super) GlobalCounter);
 
 /// The transitions between states in a `Nfa` reflect bit validity.
 #[derive(Hash, Eq, PartialEq, Clone, Copy)]
@@ -32,7 +31,7 @@ where
 
 impl fmt::Debug for State {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "S_{}", self.0)
+        write!(f, "S_{}", self.0.0)
     }
 }
 
@@ -159,11 +158,36 @@ where
         }
         Self { transitions, start, accepting }
     }
+
+    pub(crate) fn serialize_to_graphviz_dot(&self) -> String {
+        use std::fmt::Write as _;
+
+        let mut st = String::new();
+        let s = &mut st;
+        writeln!(s, "digraph {{").unwrap();
+        writeln!(s, "{:?};", self.start).unwrap();
+
+        for (src, transitions) in self.transitions.iter() {
+            for (t, dsts) in transitions.iter() {
+                let t = match t {
+                    Transition::Ref(r) => format!("{r:?}"),
+                    Transition::Byte(b) => format!("{b:?}"),
+                };
+
+                for dst in dsts.iter() {
+                    writeln!(s, "{src:?} -> {dst:?} [label={t:?}]").unwrap();
+                }
+            }
+        }
+
+        writeln!(s, "}}").unwrap();
+
+        st
+    }
 }
 
 impl State {
     pub(crate) fn new() -> Self {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        Self(COUNTER.fetch_add(1, Ordering::SeqCst))
+        Self(GlobalCounter::new())
     }
 }

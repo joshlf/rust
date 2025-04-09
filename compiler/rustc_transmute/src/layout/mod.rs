@@ -1,5 +1,6 @@
 use std::fmt::{self, Debug};
 use std::hash::Hash;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 pub(crate) mod tree;
 pub(crate) use tree::Tree;
@@ -171,6 +172,16 @@ impl Ref for ! {
     }
     fn is_mutable(&self) -> bool {
         unreachable!()
+    }
+}
+
+#[derive(Hash, Eq, PartialEq, PartialOrd, Ord, Copy, Clone)]
+struct GlobalCounter(u32);
+
+impl GlobalCounter {
+    fn new() -> Self {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        Self(COUNTER.fetch_add(1, Ordering::SeqCst))
     }
 }
 

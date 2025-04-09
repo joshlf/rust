@@ -1,5 +1,6 @@
 // tidy-alphabetical-start
 #![cfg_attr(doc, recursion_limit = "256")] // FIXME(nnethercote): will be removed by #124141
+#![cfg_attr(not(feature = "rustc"), allow(dead_code))]
 #![feature(never_type)]
 // tidy-alphabetical-end
 

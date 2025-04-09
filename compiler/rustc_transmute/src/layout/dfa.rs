@@ -1,10 +1,9 @@
 use std::fmt;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use itertools::Itertools;
 use tracing::instrument;
 
-use super::{Byte, Nfa, Ref, nfa};
+use super::{Byte, GlobalCounter, Nfa, Ref, nfa};
 use crate::Map;
 
 #[derive(PartialEq, Clone, Debug)]
@@ -54,7 +53,7 @@ where
 
 /// The states in a `Nfa` represent byte offsets.
 #[derive(Hash, Eq, PartialEq, PartialOrd, Ord, Copy, Clone)]
-pub(crate) struct State(u32);
+pub(crate) struct State(GlobalCounter);
 
 #[cfg(test)]
 #[derive(Hash, Eq, PartialEq, Clone, Copy)]
@@ -68,7 +67,7 @@ where
 
 impl fmt::Debug for State {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "S_{}", self.0)
+        write!(f, "S_{}", self.0.0)
     }
 }
 
@@ -105,119 +104,158 @@ where
 
     #[instrument(level = "debug")]
     pub(crate) fn from_nfa(nfa: Nfa<R>) -> Self {
-        let Nfa { transitions: mut nfa_transitions, start: nfa_start, accepting: nfa_accepting } =
-            nfa;
-
-        let mut dfa_transitions: Map<State, Transitions<R>> = Map::default();
-        let mut nfa_to_dfa: Map<nfa::State, State> = Map::default();
-        let dfa_start = State::new();
-        nfa_to_dfa.insert(nfa_start, dfa_start);
-
-        let mut queue = vec![(nfa_start, dfa_start)];
-
-        while let Some((nfa_state, dfa_state)) = queue.pop() {
-            if nfa_state == nfa_accepting {
-                continue;
+        let mut old = nfa;
+        println!("from_nfa: original: {}", old.serialize_to_graphviz_dot());
+        loop {
+            let (new, is_dfa) = partial_determinize(&old);
+            println!("from_nfa: {}", new.serialize_to_graphviz_dot());
+            if is_dfa {
+                return dfa_from_nfa_unchecked(new);
             }
-
-            let (byte_transitions, ref_transitions): (Vec<_>, Vec<_>) =
-                nfa_transitions[&nfa_state].iter().partition_map(|(edge, dst)| match edge {
-                    nfa::Transition::Byte(b) => itertools::Either::Left((b, dst)),
-                    nfa::Transition::Ref(_) => itertools::Either::Right((*edge, dst.clone())),
-                });
-
-            struct Foo {
-                lhs: Byte,
-                dst: crate::Set<nfa::State>,
-                overlaps: Vec<Byte>,
-            }
-            let mut foos = Vec::new();
-            let len = byte_transitions.len();
-            for i in 0..len {
-                let i_edge = *byte_transitions[i].0;
-                let i_dst = byte_transitions[i].1.clone();
-                let mut foo = Foo { lhs: i_edge, dst: i_dst, overlaps: Vec::new() };
-                for j in 0..len {
-                    if i == j {
-                        continue;
-                    }
-
-                    let j_edge = *byte_transitions[j].0;
-                    match i_edge.into_disjoint(&j_edge) {
-                        // `i_edge` and `j_edge` don't overlap.
-                        (_, None, _) => {}
-                        // `i_edge == j_edge`; this is handled by the
-                        // determinization step below.
-                        (None, _, None) => {}
-                        (_, Some(_), _) => {
-                            foo.overlaps.push(j_edge);
-                        }
-                    }
-                }
-                foos.push(foo);
-            }
-
-            let mut byte_transitions = Vec::new();
-            for Foo { lhs, dst, overlaps } in foos {
-                // INVARIANT: All values in `lhs` are disjoint from one another.
-                let mut lhs = vec![lhs];
-                for o in overlaps {
-                    let mut new_lhs = Vec::new();
-                    for l in lhs {
-                        // INVARIANT: Since `l` was in `lhs`, it is disjoint
-                        // from all other values in `lhs` by invariant. `a` and
-                        // `b` are disjoint by post-condition on
-                        // `into_disjoint`. Thus, `a` and `b` are disjoint and
-                        // also disjoint from all other values in `lhs`.
-                        let (a, b, _) = l.into_disjoint(&o);
-                        if let Some(a) = a {
-                            new_lhs.push(a);
-                        }
-                        if let Some(b) = b {
-                            new_lhs.push(b);
-                        }
-                    }
-                    lhs = new_lhs;
-                }
-
-                byte_transitions.extend(lhs.into_iter().map(|lhs| (lhs, dst.clone())));
-            }
-
-            nfa_transitions[&nfa_state] = byte_transitions
-                .into_iter()
-                .map(|(b, state)| (nfa::Transition::Byte(b), state))
-                .chain(ref_transitions.into_iter())
-                .collect();
-
-            for (nfa_transition, next_nfa_states) in nfa_transitions[&nfa_state].iter() {
-                let dfa_transitions =
-                    dfa_transitions.entry(dfa_state).or_insert_with(Default::default);
-
-                let mapped_state = next_nfa_states.iter().find_map(|x| nfa_to_dfa.get(x).copied());
-
-                let next_dfa_state = match nfa_transition {
-                    &nfa::Transition::Byte(b) => *dfa_transitions
-                        .byte_transitions
-                        .entry(b)
-                        .or_insert_with(|| mapped_state.unwrap_or_else(State::new)),
-                    &nfa::Transition::Ref(r) => *dfa_transitions
-                        .ref_transitions
-                        .entry(r)
-                        .or_insert_with(|| mapped_state.unwrap_or_else(State::new)),
-                };
-
-                for &next_nfa_state in next_nfa_states {
-                    nfa_to_dfa.entry(next_nfa_state).or_insert_with(|| {
-                        queue.push((next_nfa_state, next_dfa_state));
-                        next_dfa_state
-                    });
-                }
-            }
+            println!("Failed to fully determinize; retrying...");
+            old = new;
         }
 
-        let dfa_accepting = nfa_to_dfa[&nfa_accepting];
+        fn partial_determinize<R: Ref>(old: &Nfa<R>) -> (Nfa<R>, bool) {
+            let mut new = Nfa {
+                transitions: Map::default(),
+                start: nfa::State::new(),
+                // NOTE: This will be overwritten later. We just need to
+                // initialize with *some* value.
+                accepting: old.accepting,
+            };
 
-        Self { transitions: dfa_transitions, start: dfa_start, accepting: dfa_accepting }
+            // let mut dfa_transitions: Map<State, Transitions<R>> = Map::default();
+            let mut old_to_new: Map<nfa::State, nfa::State> = Map::default();
+            // let mut nfa_to_dfa: Map<nfa::State, State> = Map::default();
+            // let dfa_start = State::new();
+            old_to_new.insert(old.start, new.start);
+
+            let mut queue = vec![(old.start, new.start)];
+
+            while let Some((old_state, new_state)) = queue.pop() {
+                if old_state == old.accepting {
+                    continue;
+                }
+
+                let (byte_transitions, ref_transitions): (Vec<_>, Vec<_>) =
+                    old.transitions[&old_state].iter().partition_map(|(edge, dst)| match edge {
+                        nfa::Transition::Byte(b) => itertools::Either::Left((b, dst)),
+                        nfa::Transition::Ref(_) => itertools::Either::Right((*edge, dst.clone())),
+                    });
+
+                struct Foo {
+                    lhs: Byte,
+                    dst: crate::Set<nfa::State>,
+                    overlaps: Vec<Byte>,
+                }
+                let mut foos = Vec::new();
+                let len = byte_transitions.len();
+                for i in 0..len {
+                    let i_edge = *byte_transitions[i].0;
+                    let i_dst = byte_transitions[i].1.clone();
+                    let mut foo = Foo { lhs: i_edge, dst: i_dst, overlaps: Vec::new() };
+                    for j in 0..len {
+                        if i == j {
+                            continue;
+                        }
+
+                        let j_edge = *byte_transitions[j].0;
+                        match i_edge.into_disjoint(&j_edge) {
+                            // `i_edge` and `j_edge` don't overlap.
+                            (_, None, _) => {}
+                            // `i_edge == j_edge`; this is handled by the
+                            // determinization step below.
+                            (None, _, None) => {}
+                            (_, Some(_), _) => {
+                                foo.overlaps.push(j_edge);
+                            }
+                        }
+                    }
+                    foos.push(foo);
+                }
+
+                let mut byte_transitions = Vec::new();
+                for Foo { lhs, dst, overlaps } in foos {
+                    // INVARIANT: All values in `lhs` are disjoint from one another.
+                    let mut lhs = vec![lhs];
+                    for o in overlaps {
+                        let mut new_lhs = Vec::new();
+                        for l in lhs {
+                            // INVARIANT: Since `l` was in `lhs`, it is disjoint
+                            // from all other values in `lhs` by invariant. `a` and
+                            // `b` are disjoint by post-condition on
+                            // `into_disjoint`. Thus, `a` and `b` are disjoint and
+                            // also disjoint from all other values in `lhs`.
+                            let (a, b, _) = l.into_disjoint(&o);
+                            if let Some(a) = a {
+                                new_lhs.push(a);
+                            }
+                            if let Some(b) = b {
+                                new_lhs.push(b);
+                            }
+                        }
+                        lhs = new_lhs;
+                    }
+
+                    byte_transitions.extend(lhs.into_iter().map(|lhs| (lhs, dst.clone())));
+                }
+
+                let new_transitions =
+                    new.transitions.entry(new_state).or_insert_with(Default::default);
+                for (old_transition, old_next_states) in byte_transitions
+                    .into_iter()
+                    .map(|(b, state)| (nfa::Transition::Byte(b), state))
+                    .chain(ref_transitions.into_iter())
+                {
+                    let mapped_state =
+                        old_next_states.iter().find_map(|x| old_to_new.get(x).copied());
+
+                    let new_next_state =
+                        new_transitions.entry(old_transition).or_insert_with(|| {
+                            [mapped_state.unwrap_or_else(nfa::State::new)].into_iter().collect()
+                        });
+
+                    for old_next_state in old_next_states {
+                        old_to_new.entry(old_next_state).or_insert_with(|| {
+                            let mut iter = new_next_state.iter();
+                            let state = *iter.next().unwrap();
+                            debug_assert!(iter.next().is_none());
+                            queue.push((old_next_state, state));
+                            state
+                        });
+                    }
+                }
+            }
+
+            new.accepting = old_to_new[&old.accepting];
+            let is_dfa = old.transitions.len() == new.transitions.len();
+            (new, is_dfa)
+        }
+
+        fn dfa_from_nfa_unchecked<R: Ref>(nfa: Nfa<R>) -> Dfa<R> {
+            Dfa {
+                transitions: nfa
+                    .transitions
+                    .into_iter()
+                    .map(|(state, transitions)| {
+                        let (byte_transitions, ref_transitions) =
+                            transitions.into_iter().partition_map(|(transition, states)| {
+                                let state = states.into_iter().exactly_one().unwrap();
+                                let state = State::from(state);
+                                match transition {
+                                    nfa::Transition::Byte(b) => itertools::Either::Left((b, state)),
+                                    nfa::Transition::Ref(r) => itertools::Either::Right((r, state)),
+                                }
+                            });
+
+                        (state.into(), Transitions { byte_transitions, ref_transitions })
+                    })
+                    .collect(),
+                start: nfa.start.into(),
+                accepting: nfa.accepting.into(),
+            }
+        }
     }
 
     pub(crate) fn bytes_from(&self, start: State) -> Option<&Map<Byte, State>> {
@@ -245,12 +283,40 @@ where
     pub(crate) fn refs_from(&self, start: State) -> Option<&Map<R, State>> {
         Some(&self.transitions.get(&start)?.ref_transitions)
     }
+
+    pub(crate) fn serialize_to_graphviz_dot(&self) -> String {
+        use std::fmt::Write as _;
+
+        let mut st = String::new();
+        let s = &mut st;
+        writeln!(s, "digraph {{").unwrap();
+        writeln!(s, "{:?};", self.start).unwrap();
+
+        for (src, transitions) in self.transitions.iter() {
+            for (byte, dst) in transitions.byte_transitions.iter() {
+                writeln!(s, "{src:?} -> {dst:?} [label=\"{byte:?}\"]").unwrap();
+            }
+
+            for (rf, dst) in transitions.ref_transitions.iter() {
+                writeln!(s, "{src:?} -> {dst:?} [label=\"{rf:?}\"]").unwrap();
+            }
+        }
+
+        writeln!(s, "}}").unwrap();
+
+        st
+    }
 }
 
 impl State {
     pub(crate) fn new() -> Self {
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        Self(COUNTER.fetch_add(1, Ordering::SeqCst))
+        Self(GlobalCounter::new())
+    }
+}
+
+impl From<nfa::State> for State {
+    fn from(s: nfa::State) -> State {
+        State(s.0)
     }
 }
 
