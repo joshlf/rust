@@ -1,4 +1,5 @@
 // tidy-alphabetical-start
+#![cfg_attr(not(feature = "rustc"), allow(dead_code))]
 #![feature(never_type)]
 // tidy-alphabetical-end
 

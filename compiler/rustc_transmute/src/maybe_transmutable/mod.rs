@@ -126,8 +126,8 @@ where
             Err(layout::Uninhabited) => return Answer::No(Reason::DstMayHaveSafetyInvariants),
         };
 
-        println!("src: {src:?}");
-        println!("dst: {dst:?}");
+        // println!("src NFA: {}", src.serialize_to_graphviz_dot());
+        // println!("dst NFA: {}", dst.serialize_to_graphviz_dot());
 
         MaybeTransmutableQuery { src, dst, assume, context }.answer()
     }
@@ -207,7 +207,6 @@ where
                     Answer::No(Reason::DstIsTooBig)
                 }
             } else {
-                println!("assume.validity: {}", self.assume.validity);
                 let src_quantifier = if self.assume.validity {
                     // if the compiler may assume that the programmer is doing additional validity checks,
                     // (e.g.: that `src != 3u8` when the destination type is `bool`)
@@ -247,14 +246,13 @@ where
                                     let mut c = c.borrow_mut();
                                     let answer =
                                         self.answer_memo(&mut *c, src_state_prime, dst_state_prime);
-                                    println!("answer: {answer:?}");
                                     if answer == Answer::Yes {
                                         foo1.set(update_foo(foo1.get(), dst_validity));
                                     }
                                     answer
                                 })
                                 .chain(std::iter::once_with(move || {
-                                    println!("foo2: {:?}", foo2.get());
+                                    println!("foo2: src:{src_state:?} src_edge:{src_validity:?} foo2:{:?}", foo2.get());
                                     let map = |foo: Byte| match (src_validity.mask(), foo.mask()) {
                                         // We found a dst edge with the uninit
                                         // byte, which is sufficient to

@@ -1,5 +1,6 @@
 use std::fmt::{self, Debug};
 use std::hash::Hash;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 pub(crate) mod automaton;
 
@@ -47,7 +48,7 @@ impl U256 {
     fn unbounded_shl(&self, rhs: u32) -> U256 {
         if rhs < 128 {
             let upper = self.0[1].unbounded_shl(rhs);
-            let mid = self.0[0].unbounded_shl(128 - rhs);
+            let mid = self.0[0].unbounded_shr(128 - rhs);
             let lower = self.0[0].unbounded_shl(rhs);
             U256([lower, upper | mid])
         } else {
@@ -220,6 +221,16 @@ impl Ref for ! {
     }
     fn is_mutable(&self) -> bool {
         unreachable!()
+    }
+}
+
+#[derive(Hash, Eq, PartialEq, PartialOrd, Ord, Copy, Clone)]
+struct GlobalCounter(u32);
+
+impl GlobalCounter {
+    fn new() -> Self {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        Self(COUNTER.fetch_add(1, Ordering::SeqCst))
     }
 }
 
