@@ -113,6 +113,27 @@ mod bool {
     }
 
     #[test]
+    fn transmute_u8() {
+        let bool = &Tree::bool();
+        let u8 = &Tree::u8();
+        for (src, dst, assume_validity, answer) in [
+            (bool, u8, false, Answer::Yes),
+            (bool, u8, true, Answer::Yes),
+            (u8, bool, false, Answer::No(Reason::DstIsBitIncompatible)),
+            (u8, bool, true, Answer::Yes),
+        ] {
+            assert_eq!(
+                is_transmutable(
+                    src,
+                    dst,
+                    Assume { validity: assume_validity, ..Assume::default() }
+                ),
+                answer
+            );
+        }
+    }
+
+    #[test]
     fn should_permit_validity_expansion_and_reject_contraction() {
         let b0 = layout::Tree::<Def, !>::from_bits(0);
         let b1 = layout::Tree::<Def, !>::from_bits(1);
@@ -172,6 +193,29 @@ mod bool {
                 }
             }
         }
+    }
+}
+
+mod alt {
+    use super::*;
+    use crate::Answer;
+
+    #[test]
+    fn should_permit_identity_transmutation() {
+        type Tree = layout::Tree<Def, !>;
+
+        let x = Tree::Seq(vec![Tree::from_bits(0), Tree::from_bits(0)]);
+        let y = Tree::Seq(vec![Tree::bool(), Tree::from_bits(1)]);
+        let layout = Tree::Alt(vec![x, y]);
+
+        let answer = crate::maybe_transmutable::MaybeTransmutableQuery::new(
+            layout.clone(),
+            layout.clone(),
+            crate::Assume::default(),
+            UltraMinimal,
+        )
+        .answer();
+        assert_eq!(answer, Answer::Yes, "layout:{:#?}", layout);
     }
 }
 

@@ -111,7 +111,7 @@ where
         // the `src` type do not exist.
         let src = match Nfa::from_tree(src) {
             Ok(src) => src,
-            Err(Uninhabited) => return Answer::Yes,
+            Err(layout::Uninhabited) => return Answer::Yes,
         };
 
         // Convert `dst` from a tree-based representation to an NFA-based
@@ -122,8 +122,11 @@ where
         // free of safety invariants.
         let dst = match Nfa::from_tree(dst) {
             Ok(dst) => dst,
-            Err(Uninhabited) => return Answer::No(Reason::DstMayHaveSafetyInvariants),
+            Err(layout::Uninhabited) => return Answer::No(Reason::DstMayHaveSafetyInvariants),
         };
+
+        println!("src: {src:?}");
+        println!("dst: {dst:?}");
 
         MaybeTransmutableQuery { src, dst, assume, context }.answer()
     }
@@ -192,12 +195,18 @@ where
                 Answer::Yes
             } else if src_state == self.src.0.accept {
                 // extension: `size_of(Src) >= size_of(Dst)`
-                if let Some(dst_state_prime) = self.dst.byte_from(dst_state, Byte::Uninit) {
+                let mut states = self.dst.states_from(dst_state, Byte::uninit());
+                if let Some((_dst_validity, dst_state_prime)) = states.next() {
+                    // Since we looked up a state for a `Byte::uninit()`, which
+                    // is a set containing a single value (namely, the uninit
+                    // byte) `byte_from` should return at most one state.
+                    assert!(states.next().is_none());
                     self.answer_memo(cache, src_state, dst_state_prime)
                 } else {
                     Answer::No(Reason::DstIsTooBig)
                 }
             } else {
+                println!("assume.validity: {}", self.assume.validity);
                 let src_quantifier = if self.assume.validity {
                     // if the compiler may assume that the programmer is doing additional validity checks,
                     // (e.g.: that `src != 3u8` when the destination type is `bool`)
@@ -210,24 +219,103 @@ where
                     Quantifier::ForAll
                 };
 
+                let c = &core::cell::RefCell::new(&mut *cache);
                 let bytes_answer = src_quantifier.apply(
-                    // for each of the byte transitions out of the `src_state`...
-                    self.src.iter_bytes_from(src_state).map(|(src_validity, src_state_prime)| {
-                        // ...try to find a matching transition out of `dst_state`.
-                        if let Some(dst_state_prime) = self.dst.byte_from(dst_state, src_validity) {
-                            self.answer_memo(cache, src_state_prime, dst_state_prime)
-                        } else if let Some(dst_state_prime) =
-                            // otherwise, see if `dst_state` has any outgoing `Uninit` transitions
-                            // (any init byte is a valid uninit byte)
-                            self.dst.byte_from(dst_state, Byte::Uninit)
-                        {
-                            self.answer_memo(cache, src_state_prime, dst_state_prime)
-                        } else {
-                            // otherwise, we've exhausted our options.
-                            // the DFAs, from this point onwards, are bit-incompatible.
-                            Answer::No(Reason::DstIsBitIncompatible)
-                        }
-                    }),
+                    // for each of the byte set transitions out of the `src_state`...
+                    self.src.iter_bytes_from(src_state).flat_map(
+                        move |(src_validity, src_state_prime)| {
+                            // ...find all matching transitions out of `dst_state`.
+
+                            let update_foo = |old_foo: Option<Byte>, dst_validity: Byte| {
+                                Some(match old_foo {
+                                    None => dst_validity,
+                                    Some(old_foo) => match (old_foo.mask(), dst_validity.mask()) {
+                                        (None, _) | (_, None) => Byte::uninit(),
+                                        (Some(old_foo), Some(dst_validity)) => {
+                                            Byte::from_mask(old_foo.and(&dst_validity))
+                                        }
+                                    },
+                                })
+                            };
+
+                            let foo1 = std::rc::Rc::new(std::cell::Cell::new(None));
+                            let foo2 = foo1.clone();
+                            self.dst
+                                .states_from(dst_state, src_validity)
+                                .map(move |(dst_validity, dst_state_prime)| {
+                                    let mut c = c.borrow_mut();
+                                    let answer =
+                                        self.answer_memo(&mut *c, src_state_prime, dst_state_prime);
+                                    println!("answer: {answer:?}");
+                                    if answer == Answer::Yes {
+                                        foo1.set(update_foo(foo1.get(), dst_validity));
+                                    }
+                                    answer
+                                })
+                                .chain(std::iter::once_with(move || {
+                                    println!("foo2: {:?}", foo2.get());
+                                    let map = |foo: Byte| match (src_validity.mask(), foo.mask()) {
+                                        // We found a dst edge with the uninit
+                                        // byte, which is sufficient to
+                                        // transmute any byte into.
+                                        (_, None) => true,
+                                        // The src edge is uninit, and we did
+                                        // not find an uninit edge in the dst.
+                                        (None, Some(_)) => false,
+                                        // The transmutation is valid if the set
+                                        // of dst edges is a superset of the set
+                                        // of src edges.
+                                        (Some(src_mask), Some(foo_mask)) => {
+                                            foo_mask == src_mask.or(&foo_mask)
+                                        }
+                                    };
+                                    if foo2.get().map(map).unwrap_or(false) {
+                                        Answer::Yes
+                                    } else {
+                                        Answer::No(Reason::DstIsBitIncompatible)
+                                    }
+                                }))
+
+                            // // This iterator is identical to `self.iter` with
+                            // // one execption: if `self.iter` produces zero
+                            // // items, then this iterator produces `self.default`
+                            // // once.
+                            // struct Iter<I: Iterator> {
+                            //     iter: I,
+                            //     previous_iters: usize,
+                            //     default: I::Item,
+                            // }
+
+                            // impl<I: Iterator> Iterator for Iter<I>
+                            // where
+                            //     I::Item: Clone,
+                            // {
+                            //     type Item = I::Item;
+
+                            //     fn next(&mut self) -> Option<I::Item> {
+                            //         let r = self.iter.next().or_else(|| {
+                            //             (self.previous_iters == 0).then_some(self.default.clone())
+                            //         });
+                            //         self.previous_iters += 1;
+                            //         r
+                            //     }
+                            // }
+
+                            // Iter {
+                            //     iter: self.dst.states_from(dst_state, src_validity).map(
+                            //         move |dst_state_prime| {
+                            //             let mut c = c.borrow_mut();
+                            //             self.answer_memo(&mut *c, src_state_prime, dst_state_prime)
+                            //         },
+                            //     ),
+                            //     previous_iters: 0,
+                            //     // If we find no outgoing transitions, then
+                            //     // we've exhausted our options. From this point
+                            //     // forward, the DFAs are bit-incompatible.
+                            //     default: Answer::No(Reason::DstIsBitIncompatible),
+                            // }
+                        },
+                    ),
                 );
 
                 // The below early returns reflect how this code would behave:
