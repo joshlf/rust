@@ -13,18 +13,134 @@ pub(crate) use dfa::Dfa;
 #[derive(Debug)]
 pub(crate) struct Uninhabited;
 
-/// An instance of a byte is either initialized to a particular value, or uninitialized.
 #[derive(Hash, Eq, PartialEq, Clone, Copy)]
-pub(crate) enum Byte {
-    Uninit,
-    Init(u8),
+pub(crate) struct U256(
+    // Stored in little-endian order
+    [u128; 2],
+);
+
+impl U256 {
+    fn trailing_zeros(&self) -> u32 {
+        let t = self.0[0].trailing_zeros();
+        if t == 128 { t + self.0[1].trailing_zeros() } else { t }
+    }
+
+    fn trailing_ones(&self) -> u32 {
+        let t = self.0[0].trailing_ones();
+        if t == 128 { t + self.0[1].trailing_ones() } else { t }
+    }
+
+    fn unbounded_shr(&self, rhs: u32) -> U256 {
+        if rhs < 128 {
+            let lower = self.0[0].unbounded_shr(rhs);
+            let mid = self.0[1].unbounded_shl(128 - rhs);
+            let upper = self.0[1].unbounded_shr(rhs);
+            U256([lower | mid, upper])
+        } else {
+            let lower = self.0[1].unbounded_shr(rhs - 128);
+            U256([lower, 0])
+        }
+    }
+
+    pub(crate) fn and(&self, other: &U256) -> U256 {
+        U256([self.0[0] & other.0[0], self.0[1] & other.0[1]])
+    }
+
+    pub(crate) fn or(&self, other: &U256) -> U256 {
+        U256([self.0[0] | other.0[0], self.0[1] | other.0[1]])
+    }
+
+    fn not(&self) -> U256 {
+        U256([!self.0[0], !self.0[1]])
+    }
+}
+
+#[derive(Hash, Eq, PartialEq, Clone, Copy)]
+pub(crate) struct Byte {
+    // `None` means uninit
+    values: Option<U256>,
+}
+
+impl Byte {
+    fn from_iters<const N: usize, I: Iterator<Item = u8>>(vals: [I; N]) -> Byte {
+        let mut values = [0u128, 0];
+        for b in vals.into_iter().flatten() {
+            values[usize::from(b / 128)] |= 1u128 << (b % 128);
+        }
+
+        Byte { values: Some(U256(values)) }
+    }
+
+    pub(crate) fn uninit() -> Byte {
+        Byte { values: None }
+    }
+
+    pub(crate) fn from_mask(mask: U256) -> Byte {
+        Byte { values: Some(mask) }
+    }
+
+    pub(crate) fn mask(&self) -> Option<U256> {
+        self.values
+    }
+
+    /// Are any of the values in `self` transmutable into `other`?
+    pub(crate) fn transmutable_into(&self, other: &Byte) -> bool {
+        match (self.values, other.values) {
+            (None, None) => true,
+            (None, Some(_)) => false,
+            (Some(_), None) => true,
+            (Some(s), Some(o)) => [s.0[0] & o.0[0], s.0[1] & o.0[1]] != [0, 0],
+        }
+    }
+
+    pub(crate) fn into_disjoint(&self, other: &Byte) -> (Option<Byte>, Option<Byte>, Option<Byte>) {
+        match (self.values, other.values) {
+            (None, None) => (None, Some(*self), None),
+            (None, Some(_)) | (Some(_), None) => (Some(*self), None, Some(*other)),
+            (Some(s), Some(o)) => {
+                let intersection = s.and(&o);
+                let mask = intersection.not();
+                let s = s.and(&mask);
+                let o = o.and(&mask);
+
+                let b = |values: U256| {
+                    if values.0 == [0, 0] { None } else { Some(Byte { values: Some(values) }) }
+                };
+
+                (b(s), b(intersection), b(o))
+            }
+        }
+    }
 }
 
 impl fmt::Debug for Byte {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self {
-            Self::Uninit => f.write_str("??u8"),
-            Self::Init(b) => write!(f, "{b:#04x}u8"),
+        let mut range_start = 0;
+
+        match self.values {
+            None => write!(f, "{{ uninit }}"),
+            Some(mut v) => {
+                write!(f, "{{")?;
+                while v.0 != [0, 0] {
+                    let run_len = v.trailing_zeros();
+                    range_start += run_len;
+                    v = v.unbounded_shr(run_len);
+
+                    // NOTE: The loop condition ensures that we only execute if
+                    // there's some (non-zero-sized) range of 1 bits. Thus,
+                    // `run_len > 0`.
+                    let run_len = v.trailing_ones();
+                    let range_end = range_start + run_len;
+                    if run_len == 1 {
+                        write!(f, " {:?}", range_start)
+                    } else {
+                        write!(f, " {:?}", range_start..=(range_end - 1))
+                    }?;
+
+                    v = v.unbounded_shr(run_len);
+                }
+                write!(f, " }}")
+            }
         }
     }
 }
