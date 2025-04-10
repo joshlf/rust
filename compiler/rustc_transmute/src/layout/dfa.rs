@@ -23,15 +23,10 @@ where
         let start = State::new();
         let accept = State::new();
 
-        transitions
-            .entry(start)
-            .or_default()
-            .insert(Transition::Byte(Byte::Init(0x00)), [accept].into_iter().collect());
-
-        transitions
-            .entry(start)
-            .or_default()
-            .insert(Transition::Byte(Byte::Init(0x01)), [accept].into_iter().collect());
+        transitions.entry(start).or_default().insert(
+            Transition::Byte(Byte::from_iters([0x0..=0x01])),
+            [accept].into_iter().collect(),
+        );
 
         Dfa(Automaton { transitions, start, accept })
     }
@@ -91,15 +86,75 @@ where
             // Recall that `nfa_states` is a set of NFA states which can be
             // occupied during a single step of NFA execution. `nfa_edges` is
             // the set of edges out of *any* of these states, grouped by symbol.
-            let nfa_edges: Map<_, Set<_>> = nfa_states
-                .iter()
-                .flat_map(|state| nfa.0.transitions.get(state))
-                .flatten()
-                .flat_map(|(symbol, dsts)| dsts.iter().map(move |dst| (symbol, dst)))
-                .fold(Map::default(), |mut map, (symbol, dst)| {
-                    map.entry(symbol).or_default().insert(*dst);
-                    map
-                });
+            let nfa_edges = {
+                let nfa_edges = nfa_states
+                    .iter()
+                    .flat_map(|state| nfa.0.transitions.get(state))
+                    .flatten()
+                    .flat_map(|(symbol, dsts)| dsts.iter().map(move |dst| (symbol, dst)));
+
+                let mut byte_transitions: [Set<State>; 256] = [(); 256].map(|_| Set::default());
+                let mut uninit_transitions = Set::default();
+                let mut ref_transitions: Map<R, Set<State>> = Map::default();
+                for (&symbol, &dst) in nfa_edges {
+                    match symbol {
+                        Transition::Byte(b) => {
+                            for b in b.iter() {
+                                if let Some(b) = b {
+                                    byte_transitions[usize::from(b)].insert(dst);
+                                } else {
+                                    uninit_transitions.insert(dst);
+                                }
+                            }
+                        }
+                        Transition::Ref(r) => {
+                            ref_transitions.entry(r).or_default().insert(dst);
+                        }
+                    }
+                }
+
+                // `Set<nfa::State>: !Hash`, so we use `Vec` as the key type
+                // instead. In order to ensure key equality, each `Vec` must be
+                // sorted.
+                let mut states_to_edge: Map<Vec<State>, Byte> = Map::default();
+                if !uninit_transitions.is_empty() {
+                    states_to_edge.insert(
+                        {
+                            let mut states: Vec<_> = uninit_transitions.into_iter().collect();
+                            states.sort();
+                            states
+                        },
+                        Byte::uninit(),
+                    );
+                }
+
+                for (b, states) in byte_transitions.into_iter().enumerate() {
+                    if states.is_empty() {
+                        continue;
+                    }
+
+                    let b = u8::try_from(b).unwrap();
+                    let byte = states_to_edge
+                        .entry({
+                            let mut states: Vec<_> = states.into_iter().collect();
+                            states.sort();
+                            states
+                        })
+                        .or_insert(Byte::from_iters([b..=b]));
+                    byte.insert(b);
+                }
+
+                states_to_edge
+                    .into_iter()
+                    .map(|(states, edge)| {
+                        let states: Set<_> = states.into_iter().collect();
+                        (Transition::Byte(edge), states)
+                    })
+                    .chain(
+                        ref_transitions.into_iter().map(|(r, states)| (Transition::Ref(r), states)),
+                    )
+            };
+
             for (nfa_symbol, nfa_dsts) in nfa_edges {
                 // Recall that `nfa_states` and `dfa_state` are semantically
                 // equivalent in the sense that the set of paths reachable from
@@ -129,7 +184,7 @@ where
                     new_state()
                 };
 
-                dfa_transitions.insert(*nfa_symbol, [dfa_dst].into_iter().collect());
+                dfa_transitions.insert(nfa_symbol, [dfa_dst].into_iter().collect());
                 queue.push((nfa_dsts, dfa_dst));
             }
         }
@@ -137,17 +192,28 @@ where
         dfa
     }
 
-    pub(crate) fn byte_from(&self, start: State, byte: Byte) -> Option<State> {
-        Some(
-            self.0
-                .transitions
-                .get(&start)?
-                .get(&Transition::Byte(byte))?
-                .iter()
-                .copied()
-                .exactly_one()
-                .unwrap(),
-        )
+    pub(crate) fn states_from(
+        &self,
+        state: State,
+        src_validity: Byte,
+    ) -> impl Iterator<Item = (Byte, State)> {
+        self.0
+            .transitions
+            .get(&state)
+            .map(move |t| {
+                t.iter().filter_map(move |(dst_validity, dst_state)| {
+                    if let Transition::Byte(dst_validity) = dst_validity {
+                        let dst_state = dst_state.iter().exactly_one().unwrap();
+                        src_validity
+                            .transmutable_into(&dst_validity)
+                            .then_some((*dst_validity, *dst_state))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .into_iter()
+            .flatten()
     }
 
     pub(crate) fn iter_bytes_from(&self, start: State) -> impl Iterator<Item = (Byte, State)> {
@@ -212,10 +278,10 @@ mod tests {
                 start: State(1),
                 accept: State(2),
                 transitions: [
-                    (1, transitions([(0, 3), (1, 4)])),
-                    (3, transitions([(2, 5)])),
-                    (4, transitions([(2, 5), (3, 5)])),
-                    (5, transitions([(4, 2)])),
+                    (1, transitions([((0, 0), 3), ((1, 1), 4)])),
+                    (3, transitions([((2, 2), 5)])),
+                    (4, transitions([((2, 3), 5)])),
+                    (5, transitions([((4, 4), 2)])),
                 ]
                 .into_iter()
                 .map(|(state, transitions)| (State(state), transitions))
@@ -225,12 +291,15 @@ mod tests {
         );
 
         fn transitions<const N: usize, R: Ref>(
-            pairs: [(u8, u32); N],
+            pairs: [((u8, u8), u32); N],
         ) -> Map<Transition<R>, Set<State>> {
             pairs
                 .into_iter()
-                .map(|(byte, state)| {
-                    (Transition::Byte(Byte::Init(byte)), [State(state)].into_iter().collect())
+                .map(|((lo, hi), state)| {
+                    (
+                        Transition::Byte(Byte::from_iters([lo..=hi])),
+                        [State(state)].into_iter().collect(),
+                    )
                 })
                 .collect()
         }
