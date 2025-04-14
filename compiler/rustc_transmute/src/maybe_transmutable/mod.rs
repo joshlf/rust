@@ -140,8 +140,8 @@ where
     #[instrument(level = "debug", skip(self), fields(src = ?self.src, dst = ?self.dst))]
     pub(crate) fn answer(self) -> Answer<<C as QueryContext>::Ref> {
         let Self { src, dst, assume, context } = self;
-        let src = Dfa::from_nfa(src);
-        let dst = Dfa::from_nfa(dst);
+        let src = Dfa::from_nfa(State::new, src);
+        let dst = Dfa::from_nfa(State::new, dst);
         MaybeTransmutableQuery { src, dst, assume, context }.answer()
     }
 }
