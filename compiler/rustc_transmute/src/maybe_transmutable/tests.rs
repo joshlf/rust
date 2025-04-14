@@ -174,3 +174,23 @@ mod bool {
         }
     }
 }
+
+mod size {
+    use super::*;
+
+    #[test]
+    fn should_reject_size_extension() {
+        const SIZES: [usize; 5] = [1, 2, 4, 8, 16];
+        for src_size in SIZES {
+            for dst_size in SIZES {
+                let src = Tree::number(src_size);
+                let dst = Tree::number(dst_size);
+                let answer = is_transmutable(&src, &dst, Assume::default());
+                assert_eq!(
+                    answer,
+                    if src_size < dst_size { Answer::No(Reason::DstIsTooBig) } else { Answer::Yes }
+                );
+            }
+        }
+    }
+}

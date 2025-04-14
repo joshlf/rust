@@ -31,6 +31,12 @@ impl fmt::Debug for Byte {
     }
 }
 
+impl From<u8> for Byte {
+    fn from(u: u8) -> Byte {
+        Byte::Init(u)
+    }
+}
+
 pub(crate) trait Def: Debug + Hash + Eq + PartialEq + Copy + Clone {
     fn has_safety_invariants(&self) -> bool;
 }

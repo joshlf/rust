@@ -119,4 +119,13 @@ where
         }
         Nfa(Automaton { transitions, start, accept })
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_edges<B: Copy + Into<Byte>>(
+        start: u32,
+        accept: u32,
+        edges: &[(u32, B, u32)],
+    ) -> Self {
+        Nfa(Automaton::from_edges(start, accept, edges))
+    }
 }
