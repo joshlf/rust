@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use tracing::instrument;
 
 use super::{Byte, Nfa, Ref, nfa};
-use crate::Map;
+use crate::{Map, Set};
 
 #[derive(PartialEq, Clone, Debug)]
 pub(crate) struct Dfa<R>
@@ -38,13 +38,12 @@ impl<R> Transitions<R>
 where
     R: Ref,
 {
-    #[cfg(test)]
-    fn insert(&mut self, transition: Transition<R>, state: State) {
+    fn insert_from_nfa(&mut self, transition: nfa::Transition<R>, state: State) {
         match transition {
-            Transition::Byte(b) => {
+            nfa::Transition::Byte(b) => {
                 self.byte_transitions.insert(b, state);
             }
-            Transition::Ref(r) => {
+            nfa::Transition::Ref(r) => {
                 self.ref_transitions.insert(r, state);
             }
         }
@@ -94,58 +93,60 @@ where
         let start = State::new();
         let accepting = State::new();
 
-        transitions.entry(start).or_default().insert(Transition::Byte(Byte::Init(0x00)), accepting);
+        transitions.entry(start).or_default().byte_transitions.insert(Byte::Init(0x00), accepting);
 
-        transitions.entry(start).or_default().insert(Transition::Byte(Byte::Init(0x01)), accepting);
+        transitions.entry(start).or_default().byte_transitions.insert(Byte::Init(0x01), accepting);
 
         Self { transitions, start, accepting }
     }
 
-    #[instrument(level = "debug")]
-    pub(crate) fn from_nfa(nfa: Nfa<R>) -> Self {
-        let Nfa { transitions: nfa_transitions, start: nfa_start, accepting: nfa_accepting } = nfa;
+    pub(crate) fn from_nfa(mut new_state: impl FnMut() -> State, nfa: Nfa<R>) -> Self {
+        let dfa_start = new_state();
+        let mut dfa = Dfa {
+            transitions: Map::default(),
+            start: dfa_start,
+            accepting: if nfa.start == nfa.accepting { dfa_start } else { new_state() },
+        };
 
-        let mut dfa_transitions: Map<State, Transitions<R>> = Map::default();
         let mut nfa_to_dfa: Map<nfa::State, State> = Map::default();
-        let dfa_start = State::new();
-        nfa_to_dfa.insert(nfa_start, dfa_start);
+        nfa_to_dfa.insert(nfa.start, dfa_start);
 
-        let mut queue = vec![(nfa_start, dfa_start)];
+        let mut queue: Vec<(Set<_>, _)> = vec![([nfa.start].into_iter().collect(), dfa_start)];
 
-        while let Some((nfa_state, dfa_state)) = queue.pop() {
-            if nfa_state == nfa_accepting {
+        while let Some((nfa_states, dfa_state)) = queue.pop() {
+            if nfa_states.contains(&nfa.accepting) {
                 continue;
             }
 
-            for (nfa_transition, next_nfa_states) in nfa_transitions[&nfa_state].iter() {
-                let dfa_transitions =
-                    dfa_transitions.entry(dfa_state).or_insert_with(Default::default);
+            let dfa_transitions =
+                dfa.transitions.entry(dfa_state).or_insert_with(Transitions::default);
 
-                let mapped_state = next_nfa_states.iter().find_map(|x| nfa_to_dfa.get(x).copied());
-
-                let next_dfa_state = match nfa_transition {
-                    &nfa::Transition::Byte(b) => *dfa_transitions
-                        .byte_transitions
-                        .entry(b)
-                        .or_insert_with(|| mapped_state.unwrap_or_else(State::new)),
-                    &nfa::Transition::Ref(r) => *dfa_transitions
-                        .ref_transitions
-                        .entry(r)
-                        .or_insert_with(|| mapped_state.unwrap_or_else(State::new)),
+            let nfa_edges: Map<_, Set<_>> = nfa_states
+                .iter()
+                .flat_map(|state| nfa.transitions.get(state))
+                .flatten()
+                .flat_map(|(symbol, dsts)| dsts.iter().map(move |dst| (symbol, dst)))
+                .fold(Map::default(), |mut map, (symbol, dst)| {
+                    map.entry(symbol).or_default().insert(*dst);
+                    map
+                });
+            for (nfa_symbol, nfa_dsts) in nfa_edges {
+                let dfa_dst = if nfa_dsts.contains(&nfa.accepting) {
+                    dfa.accepting
+                } else if nfa_dsts.len() == 1 {
+                    use itertools::Itertools as _;
+                    let nfa_dst = *nfa_dsts.iter().exactly_one().unwrap();
+                    *nfa_to_dfa.entry(nfa_dst).or_insert_with(&mut new_state)
+                } else {
+                    new_state()
                 };
 
-                for &next_nfa_state in next_nfa_states {
-                    nfa_to_dfa.entry(next_nfa_state).or_insert_with(|| {
-                        queue.push((next_nfa_state, next_dfa_state));
-                        next_dfa_state
-                    });
-                }
+                dfa_transitions.insert_from_nfa(*nfa_symbol, dfa_dst);
+                queue.push((nfa_dsts, dfa_dst));
             }
         }
 
-        let dfa_accepting = nfa_to_dfa[&nfa_accepting];
-
-        Self { transitions: dfa_transitions, start: dfa_start, accepting: dfa_accepting }
+        dfa
     }
 
     pub(crate) fn bytes_from(&self, start: State) -> Option<&Map<Byte, State>> {
@@ -158,6 +159,31 @@ where
 
     pub(crate) fn refs_from(&self, start: State) -> Option<&Map<R, State>> {
         Some(&self.transitions.get(&start)?.ref_transitions)
+    }
+
+    #[cfg(test)]
+    fn serialize_to_graphviz_dot(&self) -> String {
+        use std::fmt::Write as _;
+
+        let mut st = String::new();
+        let s = &mut st;
+        writeln!(s, "digraph {{").unwrap();
+        writeln!(s, "{:?} [shape = doublecircle]", self.start).unwrap();
+        writeln!(s, "{:?} [shape = doublecircle]", self.accepting).unwrap();
+
+        for (src, transitions) in self.transitions.iter() {
+            for (byte, dst) in transitions.byte_transitions.iter() {
+                writeln!(s, "{src:?} -> {dst:?} [label=\"{byte:?}\"]").unwrap();
+            }
+
+            for (rf, dst) in transitions.ref_transitions.iter() {
+                writeln!(s, "{src:?} -> {dst:?} [label=\"{rf:?}\"]").unwrap();
+            }
+        }
+
+        writeln!(s, "}}").unwrap();
+
+        st
     }
 }
 
@@ -177,6 +203,74 @@ where
         match nfa_transition {
             nfa::Transition::Byte(byte) => Transition::Byte(byte),
             nfa::Transition::Ref(r) => Transition::Ref(r),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type Tree = crate::layout::Tree<!, !>;
+    type Nfa = crate::layout::Nfa<!>;
+    type Dfa = super::Dfa<!>;
+
+    #[test]
+    fn test_determinization() {
+        // Construct the following NFA with start state A and accepting state E:
+        //
+        //     +-- A --+
+        //   0 | / 1   | 1
+        //     B       C
+        //   2 |       | 3
+        //     +-- D --+
+        //       4 |
+        //         E
+        //
+        // Note that A->B has two edges: one labeled 0, and one labeled 1.
+        let tree = Tree::from_bits(0)
+            .or(Tree::from_bits(1))
+            .then(Tree::from_bits(2))
+            .or(Tree::from_bits(1).then(Tree::from_bits(3)))
+            .then(Tree::from_bits(4));
+        let nfa = Nfa::from_tree(tree).unwrap();
+
+        let mut ctr = 0;
+        let new_state = || {
+            ctr += 1;
+            super::State(ctr)
+        };
+
+        let nfa_graphviz = nfa.serialize_to_graphviz_dot();
+        let dfa = Dfa::from_nfa(new_state, nfa);
+        let dfa_graphviz = dfa.serialize_to_graphviz_dot();
+
+        assert_eq!(
+            dfa,
+            Dfa {
+                start: State(1),
+                accepting: State(2),
+                transitions: [
+                    (1, transitions([(0, 3), (1, 4)])),
+                    (3, transitions([(2, 5)])),
+                    (4, transitions([(2, 5), (3, 5)])),
+                    (5, transitions([(4, 2)])),
+                ]
+                .into_iter()
+                .map(|(state, transitions)| (State(state), transitions))
+                .collect(),
+            },
+            "NFA: {nfa_graphviz}\nDFA: {dfa_graphviz}"
+        );
+
+        fn transitions<const N: usize, R: Ref>(pairs: [(u8, u32); N]) -> Transitions<R> {
+            Transitions {
+                byte_transitions: pairs
+                    .into_iter()
+                    .map(|(byte, state)| (Byte::Init(byte), State(state)))
+                    .collect(),
+                ref_transitions: Map::default(),
+            }
         }
     }
 }

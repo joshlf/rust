@@ -159,6 +159,27 @@ where
         }
         Self { transitions, start, accepting }
     }
+
+    #[cfg(test)]
+    pub(crate) fn serialize_to_graphviz_dot(&self) -> String {
+        use std::fmt::Write as _;
+
+        let mut st = String::new();
+        let s = &mut st;
+        writeln!(s, "digraph {{").unwrap();
+        writeln!(s, "{:?} [shape = doublecircle]", self.start).unwrap();
+        writeln!(s, "{:?} [shape = doublecircle]", self.accepting).unwrap();
+
+        for (src, transitions) in self.transitions.iter() {
+            for (t, dst) in transitions.iter() {
+                writeln!(s, "{src:?} -> {dst:?} [label=\"{t:?}\"]").unwrap();
+            }
+        }
+
+        writeln!(s, "}}").unwrap();
+
+        st
+    }
 }
 
 impl State {
