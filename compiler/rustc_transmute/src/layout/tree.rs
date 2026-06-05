@@ -105,6 +105,21 @@ where
         Self::alt([x, y, z])
     }
 
+    /// A `Tree` whose layout matches that of `std::num::NonZero<char>`.
+    pub(crate) fn nonzero_char(order: Endian) -> Self {
+        // This is `char`'s bit validity with `\0` removed:
+        // - [0x000001, 0x00D7FF]
+        // - [0x00E000, 0x10FFFF]
+        const _0: RangeInclusive<u8> = 0..=0;
+        const BYTE: RangeInclusive<u8> = 0x00..=0xFF;
+
+        let a = Self::from_big_endian(order, [_0, _0, _0, 0x01..=0xFF]);
+        let b = Self::from_big_endian(order, [_0, _0, 0x01..=0xD7, BYTE]);
+        let c = Self::from_big_endian(order, [_0, _0, 0xE0..=0xFF, BYTE]);
+        let d = Self::from_big_endian(order, [_0, 0x01..=0x10, BYTE, BYTE]);
+        Self::alt([a, b, c, d])
+    }
+
     /// A `Tree` whose layout matches `std::num::NonZeroXxx`.
     #[allow(dead_code)]
     pub(crate) fn nonzero(width_in_bytes: u64) -> Self {
@@ -250,8 +265,10 @@ where
 #[cfg(feature = "rustc")]
 pub(crate) mod rustc {
     use rustc_abi::{
-        FieldIdx, FieldsShape, Layout, Size, TagEncoding, TyAndLayout, VariantIdx, Variants,
+        BackendRepr, FieldIdx, FieldsShape, Layout, Scalar, Size, TagEncoding, TyAndLayout,
+        VariantIdx, Variants,
     };
+    use rustc_hir::def_id::DefId;
     use rustc_middle::ty::layout::{HasTyCtxt, LayoutCx, LayoutError};
     use rustc_middle::ty::{
         self, AdtDef, AdtKind, List, Region, ScalarInt, Ty, TyCtxt, TypeVisitableExt,
@@ -287,7 +304,11 @@ pub(crate) mod rustc {
     }
 
     impl<'tcx> Tree<Def<'tcx>, Region<'tcx>, Ty<'tcx>> {
-        pub(crate) fn from_ty(ty: Ty<'tcx>, cx: LayoutCx<'tcx>) -> Result<Self, Err> {
+        pub(crate) fn from_ty(
+            ty: Ty<'tcx>,
+            cx: LayoutCx<'tcx>,
+            caller_module: DefId,
+        ) -> Result<Self, Err> {
             use rustc_abi::HasDataLayout;
             let layout = layout_of(cx, ty)?;
 
@@ -316,7 +337,7 @@ pub(crate) mod rustc {
                     Ok(Self::number(width.try_into().unwrap()))
                 }
 
-                ty::Tuple(members) => Self::from_tuple((ty, layout), members, cx),
+                ty::Tuple(members) => Self::from_tuple((ty, layout), members, cx, caller_module),
 
                 ty::Array(inner_ty, _len) => {
                     let FieldsShape::Array { stride, count } = &layout.fields else {
@@ -324,16 +345,84 @@ pub(crate) mod rustc {
                     };
                     let inner_layout = layout_of(cx, *inner_ty)?;
                     assert_eq!(*stride, inner_layout.size);
-                    let elt = Tree::from_ty(*inner_ty, cx)?;
+                    let elt = Tree::from_ty(*inner_ty, cx, caller_module)?;
                     Ok(std::iter::repeat_n(elt, *count as usize)
                         .fold(Tree::unit(), |tree, elt| tree.then(elt)))
                 }
 
-                ty::Adt(adt_def, _args_ref) if !ty.is_box() => match adt_def.adt_kind() {
-                    AdtKind::Struct => Self::from_struct((ty, layout), *adt_def, cx),
-                    AdtKind::Enum => Self::from_enum((ty, layout), *adt_def, cx),
-                    AdtKind::Union => Self::from_union((ty, layout), *adt_def, cx),
-                },
+                ty::Adt(adt_def, args_ref) if !ty.is_box() => {
+                    let scalar = match layout.backend_repr {
+                        BackendRepr::Scalar(scalar) => Some(scalar),
+                        _ => None,
+                    };
+
+                    let is_transparent = adt_def.repr().transparent();
+                    match adt_def.adt_kind() {
+                        AdtKind::Struct
+                            if is_transparent
+                                && let Some(scalar) = scalar
+                                && !scalar.is_always_valid(&cx) =>
+                        {
+                            let variant = adt_def.non_enum_variant();
+                            // For now, only support `repr(transparent)` types
+                            // with a single field. Technically
+                            // `repr(transparent)` also works with types with
+                            // any number of zero-sized fields (in addition to
+                            // their single non-zero-sized field), but no such
+                            // types exist in the standard library which also
+                            // use
+                            // `#[rustc_layout_scalar_valid_range_(start|end)]`.
+                            let [field] = &variant.fields.as_slice().raw else {
+                                return Err(Err::NotYetSupported);
+                            };
+
+                            let field_ty = cx.tcx().normalize_erasing_regions(
+                                cx.typing_env,
+                                field.ty(cx.tcx(), args_ref),
+                            );
+
+                            if let Some(field_tree) =
+                                Self::nonzero_scalar_tree(field_ty, scalar, cx)?
+                            {
+                                Ok(Self::seq([
+                                    Self::def(Def::Adt(
+                                        adt_def.clone(),
+                                        struct_has_safety_invariants(
+                                            adt_def.non_enum_variant(),
+                                            caller_module,
+                                            cx.tcx(),
+                                        ),
+                                    )),
+                                    Self::def(Def::Field(
+                                        field,
+                                        field_has_safety_invariants(field, caller_module, cx.tcx()),
+                                    )),
+                                    field_tree,
+                                ]))
+                            } else {
+                                Err(Err::NotYetSupported)
+                            }
+                        }
+                        AdtKind::Struct
+                            if scalar.is_none_or(|scalar| scalar.is_always_valid(&cx)) =>
+                        {
+                            Self::from_struct((ty, layout), *adt_def, cx, caller_module)
+                        }
+                        AdtKind::Enum
+                            if scalar.is_none_or(|scalar| scalar.is_always_valid(&cx)) =>
+                        {
+                            Self::from_enum((ty, layout), *adt_def, cx, caller_module)
+                        }
+                        AdtKind::Union
+                            if scalar.is_none_or(|scalar| scalar.is_always_valid(&cx)) =>
+                        {
+                            Self::from_union((ty, layout), *adt_def, cx, caller_module)
+                        }
+                        AdtKind::Struct | AdtKind::Enum | AdtKind::Union => {
+                            Err(Err::NotYetSupported)
+                        }
+                    }
+                }
 
                 ty::Ref(region, ty, mutability) => {
                     let layout = layout_of(cx, *ty)?;
@@ -360,16 +449,24 @@ pub(crate) mod rustc {
             (ty, layout): (Ty<'tcx>, Layout<'tcx>),
             members: &'tcx List<Ty<'tcx>>,
             cx: LayoutCx<'tcx>,
+            caller_module: DefId,
         ) -> Result<Self, Err> {
             match &layout.fields {
                 FieldsShape::Primitive => {
                     assert_eq!(members.len(), 1);
                     let inner_ty = members[0];
-                    Self::from_ty(inner_ty, cx)
+                    Self::from_ty(inner_ty, cx, caller_module)
                 }
                 FieldsShape::Arbitrary { offsets, .. } => {
                     assert_eq!(offsets.len(), members.len());
-                    Self::from_variant(Def::Primitive, None, (ty, layout), layout.size, cx)
+                    Self::from_variant(
+                        Def::Primitive,
+                        None,
+                        (ty, layout),
+                        layout.size,
+                        cx,
+                        caller_module,
+                    )
                 }
                 FieldsShape::Array { .. } | FieldsShape::Union(_) => Err(Err::NotYetSupported),
             }
@@ -384,10 +481,14 @@ pub(crate) mod rustc {
             (ty, layout): (Ty<'tcx>, Layout<'tcx>),
             def: AdtDef<'tcx>,
             cx: LayoutCx<'tcx>,
+            caller_module: DefId,
         ) -> Result<Self, Err> {
             assert!(def.is_struct());
-            let def = Def::Adt(def);
-            Self::from_variant(def, None, (ty, layout), layout.size, cx)
+            let def = Def::Adt(
+                def,
+                struct_has_safety_invariants(def.non_enum_variant(), caller_module, cx.tcx()),
+            );
+            Self::from_variant(def, None, (ty, layout), layout.size, cx, caller_module)
         }
 
         /// Constructs a `Tree` from an enum.
@@ -399,6 +500,7 @@ pub(crate) mod rustc {
             (ty, layout): (Ty<'tcx>, Layout<'tcx>),
             def: AdtDef<'tcx>,
             cx: LayoutCx<'tcx>,
+            caller_module: DefId,
         ) -> Result<Self, Err> {
             assert!(def.is_enum());
 
@@ -411,13 +513,17 @@ pub(crate) mod rustc {
                 let tag = cx.tcx().tag_for_variant(
                     cx.typing_env.as_query_input((cx.tcx().erase_and_anonymize_regions(ty), index)),
                 );
-                let variant_def = Def::Variant(def.variant(index));
+                let variant_def = Def::Variant(
+                    def.variant(index),
+                    variant_has_safety_invariants(def.variant(index), caller_module, cx.tcx()),
+                );
                 Self::from_variant(
                     variant_def,
                     tag.map(|tag| (tag, index, encoding.unwrap())),
                     (ty, variant_layout),
                     layout.size,
                     cx,
+                    caller_module,
                 )
             };
 
@@ -445,7 +551,7 @@ pub(crate) mod rustc {
                         },
                     )?;
 
-                    Ok(Self::def(Def::Adt(def)).then(variants))
+                    Ok(Self::def(Def::Adt(def, false)).then(variants))
                 }
             }
         }
@@ -465,6 +571,7 @@ pub(crate) mod rustc {
             (ty, layout): (Ty<'tcx>, Layout<'tcx>),
             total_size: Size,
             cx: LayoutCx<'tcx>,
+            caller_module: DefId,
         ) -> Result<Self, Err> {
             // This constructor does not support non-`FieldsShape::Arbitrary`
             // layouts.
@@ -503,9 +610,18 @@ pub(crate) mod rustc {
 
                 let field_ty = ty_field(cx, (ty, layout), field_idx);
                 let field_layout = layout_of(cx, field_ty)?;
-                let field_tree = Self::from_ty(field_ty, cx)?;
+                let field_tree = Self::from_ty(field_ty, cx, caller_module)?;
 
-                struct_tree = struct_tree.then(padding).then(field_tree);
+                struct_tree = struct_tree.then(padding);
+
+                if let Some(field) = field_def((ty, layout), field_idx) {
+                    struct_tree = struct_tree.then(Self::def(Def::Field(
+                        field,
+                        field_has_safety_invariants(field, caller_module, cx.tcx()),
+                    )));
+                }
+
+                struct_tree = struct_tree.then(field_tree);
 
                 size += padding_needed + field_layout.size;
             }
@@ -545,6 +661,7 @@ pub(crate) mod rustc {
             (ty, layout): (Ty<'tcx>, Layout<'tcx>),
             def: AdtDef<'tcx>,
             cx: LayoutCx<'tcx>,
+            caller_module: DefId,
         ) -> Result<Self, Err> {
             assert!(def.is_union());
 
@@ -560,7 +677,7 @@ pub(crate) mod rustc {
                 |fields, (idx, _field_def)| {
                     let field_ty = ty_field(cx, (ty, layout), idx);
                     let field_layout = layout_of(cx, field_ty)?;
-                    let field = Self::from_ty(field_ty, cx)?;
+                    let field = Self::from_ty(field_ty, cx, caller_module)?;
                     let trailing_padding_needed = layout.size - field_layout.size;
                     let trailing_padding = Self::padding(trailing_padding_needed.bytes_usize());
                     let field_and_padding = field.then(trailing_padding);
@@ -568,8 +685,83 @@ pub(crate) mod rustc {
                 },
             )?;
 
-            Ok(Self::def(Def::Adt(def)).then(fields))
+            Ok(Self::def(Def::Adt(def, false)).then(fields))
         }
+
+        fn nonzero_scalar_tree(
+            field_ty: Ty<'tcx>,
+            scalar: Scalar,
+            cx: LayoutCx<'tcx>,
+        ) -> Result<Option<Self>, Err> {
+            let scalar_size = scalar.size(&cx);
+            let valid_range = scalar.valid_range(&cx);
+            let base_ty = transparent_scalar_base_ty(field_ty, cx)?;
+
+            match *base_ty.kind() {
+                ty::Int(_) | ty::Uint(_)
+                    if valid_range.start == 1
+                        && valid_range.end == scalar_size.unsigned_int_max() =>
+                {
+                    Ok(Some(Self::nonzero(scalar_size.bytes())))
+                }
+                ty::Char if valid_range.start == 1 && valid_range.end == 0x10FFFF => {
+                    Ok(Some(Self::nonzero_char(cx.tcx().data_layout.endian.into())))
+                }
+                _ => Ok(None),
+            }
+        }
+    }
+
+    fn transparent_scalar_base_ty<'tcx>(ty: Ty<'tcx>, cx: LayoutCx<'tcx>) -> Result<Ty<'tcx>, Err> {
+        let layout = layout_of(cx, ty)?;
+        match ty.kind() {
+            ty::Pat(base, _) => Ok(*base),
+            ty::Adt(def, args) if def.repr().transparent() => {
+                let variant = def.non_enum_variant();
+                let [field] = &variant.fields.as_slice().raw else { return Ok(ty) };
+                let field_ty =
+                    cx.tcx().normalize_erasing_regions(cx.typing_env, field.ty(cx.tcx(), args));
+                let field_layout = layout_of(cx, field_ty)?;
+                if field_layout.size == layout.size
+                    && matches!(layout.backend_repr, BackendRepr::Scalar(_))
+                    && matches!(field_layout.backend_repr, BackendRepr::Scalar(_))
+                {
+                    transparent_scalar_base_ty(field_ty, cx)
+                } else {
+                    Ok(ty)
+                }
+            }
+            _ => Ok(ty),
+        }
+    }
+
+    fn struct_has_safety_invariants<'tcx>(
+        variant: &'tcx ty::VariantDef,
+        caller_module: DefId,
+        tcx: TyCtxt<'tcx>,
+    ) -> bool {
+        variant.fields.is_empty()
+            || variant.field_list_has_applicable_non_exhaustive()
+            || variant.ctor_def_id().is_some_and(|ctor_def_id| {
+                !tcx.visibility(ctor_def_id).is_accessible_from(caller_module, tcx)
+            })
+    }
+
+    fn variant_has_safety_invariants<'tcx>(
+        variant: &'tcx ty::VariantDef,
+        caller_module: DefId,
+        tcx: TyCtxt<'tcx>,
+    ) -> bool {
+        variant.field_list_has_applicable_non_exhaustive()
+            || !tcx.visibility(variant.def_id).is_accessible_from(caller_module, tcx)
+    }
+
+    fn field_has_safety_invariants<'tcx>(
+        field: &'tcx ty::FieldDef,
+        caller_module: DefId,
+        tcx: TyCtxt<'tcx>,
+    ) -> bool {
+        field.safety.is_unsafe() || !field.vis.is_accessible_from(caller_module, tcx)
     }
 
     fn ty_field<'tcx>(
@@ -601,6 +793,21 @@ pub(crate) mod rustc {
                 "only a subset of `Ty::ty_and_layout_field`'s functionality is implemented. implementation needed for {:?}",
                 kind
             ),
+        }
+    }
+
+    fn field_def<'tcx>(
+        (ty, layout): (Ty<'tcx>, Layout<'tcx>),
+        i: FieldIdx,
+    ) -> Option<&'tcx ty::FieldDef> {
+        match ty.kind() {
+            ty::Adt(def, _args) => match layout.variants {
+                Variants::Single { index } => Some(&def.variant(index).fields[i]),
+                Variants::Empty => panic!("there is no field in Variants::Empty types"),
+                Variants::Multiple { .. } => None,
+            },
+            ty::Tuple(_) => None,
+            _ => None,
         }
     }
 

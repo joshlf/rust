@@ -3,7 +3,7 @@ use std::ops::Deref;
 
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::LangItem;
-use rustc_hir::def_id::{CRATE_DEF_ID, DefId};
+use rustc_hir::def_id::{CRATE_DEF_ID, DefId, LocalModDefId};
 use rustc_infer::infer::canonical::query_response::make_query_region_constraints;
 use rustc_infer::infer::canonical::{
     Canonical, CanonicalExt as _, CanonicalQueryInput, CanonicalVarKind, CanonicalVarValues,
@@ -375,7 +375,9 @@ impl<'tcx> rustc_next_trait_solver::delegate::SolverDelegate for SolverDelegate<
         };
 
         // FIXME(transmutability): This really should be returning nested goals for `Answer::If*`
-        match rustc_transmute::TransmuteTypeEnv::new(self.0.tcx).is_transmutable(src, dst, assume) {
+        match rustc_transmute::TransmuteTypeEnv::new(self.0.tcx, LocalModDefId::CRATE_DEF_ID)
+            .is_transmutable(src, dst, assume)
+        {
             rustc_transmute::Answer::Yes => Ok(Certainty::Yes),
             rustc_transmute::Answer::No(_) | rustc_transmute::Answer::If(_) => Err(NoSolution),
         }
